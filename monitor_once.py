@@ -1,4 +1,4 @@
-"""Check Telegram group messages since the previous scheduled run.
+        """Check Telegram group messages since the previous scheduled run.
 
 Designed for GitHub Actions: no long-running process and no local session file.
 The Telegram user session and checkpoint encryption key must be stored in Actions secrets.
@@ -103,10 +103,19 @@ def send_bot_notification(text: str) -> None:
         },
         timeout=20,
     )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Bot API error: {payload}")
+    # Telegram usually includes a useful JSON description even on HTTP 403.
+    # Parse it before raising, otherwise requests only reports the generic status.
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"description": response.text[:1000]}
+
+    if not response.ok or not payload.get("ok"):
+        description = payload.get("description") or response.text[:1000] or "Unknown Telegram Bot API error"
+        error_code = payload.get("error_code", response.status_code)
+        raise RuntimeError(
+            f"Telegram Bot API error {error_code} (HTTP {response.status_code}): {description}"
+        )
 
 
 def read_state() -> dict[str, Any] | None:
