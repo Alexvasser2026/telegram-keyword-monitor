@@ -30,10 +30,10 @@ STATE_ENCRYPTION_KEY = os.getenv("STATE_ENCRYPTION_KEY", "").strip().encode()
 KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "").split("|") if x.strip()]
 if not KEYWORDS:
     KEYWORDS = [
-        "помочь", "помоги", "помогите", "помочь пожалуйста", "нужна помощь",
-        "нужна ваша помощь", "кто может", "кто-нибудь может", "кто нибудь может",
-        "кто знает", "подскажите", "посоветуйте", "не получается", "как сделать",
-        "ищу помощь", "есть кто", "кто разбирается", "помощь нужна", "помогите пожалуйста",
+        "РїРѕРјРѕС‡СЊ", "РїРѕРјРѕРіРё", "РїРѕРјРѕРіРёС‚Рµ", "РїРѕРјРѕС‡СЊ РїРѕР¶Р°Р»СѓР№СЃС‚Р°", "РЅСѓР¶РЅР° РїРѕРјРѕС‰СЊ",
+        "РЅСѓР¶РЅР° РІР°С€Р° РїРѕРјРѕС‰СЊ", "РєС‚Рѕ РјРѕР¶РµС‚", "РєС‚Рѕ-РЅРёР±СѓРґСЊ РјРѕР¶РµС‚", "РєС‚Рѕ РЅРёР±СѓРґСЊ РјРѕР¶РµС‚",
+        "РєС‚Рѕ Р·РЅР°РµС‚", "РїРѕРґСЃРєР°Р¶РёС‚Рµ", "РїРѕСЃРѕРІРµС‚СѓР№С‚Рµ", "РЅРµ РїРѕР»СѓС‡Р°РµС‚СЃСЏ", "РєР°Рє СЃРґРµР»Р°С‚СЊ",
+        "РёС‰Сѓ РїРѕРјРѕС‰СЊ", "РµСЃС‚СЊ РєС‚Рѕ", "РєС‚Рѕ СЂР°Р·Р±РёСЂР°РµС‚СЃСЏ", "РїРѕРјРѕС‰СЊ РЅСѓР¶РЅР°", "РїРѕРјРѕРіРёС‚Рµ РїРѕР¶Р°Р»СѓР№СЃС‚Р°",
     ]
 WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") if x.strip()]
 MAX_TEXT_CHARS = 2600
@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 
 def norm(value: str) -> str:
-    return (value or "").lower().replace("ё", "е").strip()
+    return (value or "").lower().replace("С‘", "Рµ").strip()
 
 
 def is_group(entity: Any) -> bool:
@@ -69,7 +69,7 @@ def matches_group(entity: Any) -> bool:
 
 def sender_label(sender: Any) -> str:
     if sender is None:
-        return "Не удалось определить"
+        return "РќРµ СѓРґР°Р»РѕСЃСЊ РѕРїСЂРµРґРµР»РёС‚СЊ"
     first = getattr(sender, "first_name", None) or ""
     last = getattr(sender, "last_name", None) or ""
     full = f"{first} {last}".strip()
@@ -80,7 +80,7 @@ def sender_label(sender: Any) -> str:
         return full
     if username:
         return f"@{username}"
-    return getattr(sender, "title", None) or "Неизвестный автор"
+    return getattr(sender, "title", None) or "РќРµРёР·РІРµСЃС‚РЅС‹Р№ Р°РІС‚РѕСЂ"
 
 
 def make_message_link(entity: Any, message_id: int) -> str | None:
@@ -103,13 +103,19 @@ def send_bot_notification(text: str) -> None:
         },
         timeout=20,
     )
-            if not response.ok:
+    # Telegram usually includes a useful JSON description even on HTTP 403.
+    # Parse it before raising, otherwise requests only reports the generic status.
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"description": response.text[:1000]}
+
+    if not response.ok or not payload.get("ok"):
+        description = payload.get("description") or response.text[:1000] or "Unknown Telegram Bot API error"
+        error_code = payload.get("error_code", response.status_code)
         raise RuntimeError(
-            f"Telegram Bot API error {response.status_code}: {response.text}"
+            f"Telegram Bot API error {error_code} (HTTP {response.status_code}): {description}"
         )
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Bot API error: {payload}")
 
 
 def read_state() -> dict[str, Any] | None:
@@ -165,7 +171,7 @@ async def main() -> None:
         if not await client.is_user_authorized():
             raise RuntimeError("TELEGRAM_SESSION is expired or invalid. Generate a new session and update the secret.")
         me = await client.get_me()
-        name = getattr(me, "username", None) or getattr(me, "first_name", None) or "аккаунт"
+        name = getattr(me, "username", None) or getattr(me, "first_name", None) or "Р°РєРєР°СѓРЅС‚"
         logging.info("Connected to Telegram as %s", name)
 
         dialogs = []
@@ -184,10 +190,10 @@ async def main() -> None:
             write_state(state)
             await asyncio.to_thread(
                 send_bot_notification,
-                "✅ <b>Мониторинг включён.</b>\n"
-                f"Аккаунт: {html.escape(name)}\n"
-                f"Групп под наблюдением: {len(dialogs)}\n"
-                "Буду проверять новые сообщения примерно раз в 5 минут. Старые сообщения не проверяю.",
+                "вњ… <b>РњРѕРЅРёС‚РѕСЂРёРЅРі РІРєР»СЋС‡С‘РЅ.</b>\n"
+                f"РђРєРєР°СѓРЅС‚: {html.escape(name)}\n"
+                f"Р“СЂСѓРїРї РїРѕРґ РЅР°Р±Р»СЋРґРµРЅРёРµРј: {len(dialogs)}\n"
+                "Р‘СѓРґСѓ РїСЂРѕРІРµСЂСЏС‚СЊ РЅРѕРІС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ РїСЂРёРјРµСЂРЅРѕ СЂР°Р· РІ 5 РјРёРЅСѓС‚. РЎС‚Р°СЂС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ РЅРµ РїСЂРѕРІРµСЂСЏСЋ.",
             )
             logging.info("Baseline saved for %d groups", len(dialogs))
             return
@@ -226,21 +232,21 @@ async def main() -> None:
                     sender = await message.get_sender()
                 except Exception:
                     sender = None
-                title = getattr(entity, "title", None) or "Группа без названия"
+                title = getattr(entity, "title", None) or "Р“СЂСѓРїРїР° Р±РµР· РЅР°Р·РІР°РЅРёСЏ"
                 source_text = body[:MAX_TEXT_CHARS]
                 if len(body) > MAX_TEXT_CHARS:
-                    source_text += "…"
+                    source_text += "вЂ¦"
                 parts = [
-                    "<b>🔔 Найдено сообщение по ключевым словам</b>",
-                    f"<b>Группа:</b> {html.escape(title)}",
-                    f"<b>Автор:</b> {html.escape(sender_label(sender))}",
-                    f"<b>Совпадения:</b> {html.escape(', '.join(found))}",
+                    "<b>рџ”” РќР°Р№РґРµРЅРѕ СЃРѕРѕР±С‰РµРЅРёРµ РїРѕ РєР»СЋС‡РµРІС‹Рј СЃР»РѕРІР°Рј</b>",
+                    f"<b>Р“СЂСѓРїРїР°:</b> {html.escape(title)}",
+                    f"<b>РђРІС‚РѕСЂ:</b> {html.escape(sender_label(sender))}",
+                    f"<b>РЎРѕРІРїР°РґРµРЅРёСЏ:</b> {html.escape(', '.join(found))}",
                     "",
-                    f"<b>Сообщение:</b>\n{html.escape(source_text)}",
+                    f"<b>РЎРѕРѕР±С‰РµРЅРёРµ:</b>\n{html.escape(source_text)}",
                 ]
                 link = make_message_link(entity, message.id)
                 if link:
-                    parts += ["", f'<a href="{html.escape(link, quote=True)}">Открыть сообщение в Telegram</a>']
+                    parts += ["", f'<a href="{html.escape(link, quote=True)}">РћС‚РєСЂС‹С‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ РІ Telegram</a>']
                 await asyncio.to_thread(send_bot_notification, "\n".join(parts))
                 logging.info("Alert sent: %s | %s", title, ", ".join(found))
             groups_state[key] = latest_id
