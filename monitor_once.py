@@ -103,11 +103,10 @@ def send_bot_notification(text: str) -> None:
         },
         timeout=20,
     )
-        if not response.ok:
+            if not response.ok:
         raise RuntimeError(
             f"Telegram Bot API error {response.status_code}: {response.text}"
         )
-    response.raise_for_status()
     payload = response.json()
     if not payload.get("ok"):
         raise RuntimeError(f"Bot API error: {payload}")
