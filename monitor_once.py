@@ -113,7 +113,7 @@ WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") 
 # Ограничиваем объём одной части уведомления, чтобы несколько сообщений
 # можно было объединить в одно сообщение Telegram.
 MAX_TEXT_CHARS = 850
-MAX_ALERTS_PER_RUN = 100
+MAX_ALERTS_PER_RUN = 50
 ALERTS_PER_DIGEST = 3
 DIGEST_PAUSE_SECONDS = 2
 
