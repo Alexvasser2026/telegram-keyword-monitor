@@ -16,6 +16,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel
 
@@ -109,7 +110,12 @@ for _keyword in [*DEFAULT_KEYWORDS, *CUSTOM_KEYWORDS]:
         _seen_keywords.add(_normalized_keyword)
         KEYWORDS.append(_keyword)
 WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") if x.strip()]
-MAX_TEXT_CHARS = 2600
+# Ограничиваем объём одной части уведомления, чтобы несколько сообщений
+# можно было объединить в одно сообщение Telegram.
+MAX_TEXT_CHARS = 850
+MAX_ALERTS_PER_RUN = 12
+ALERTS_PER_DIGEST = 3
+DIGEST_PAUSE_SECONDS = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -171,12 +177,24 @@ async def send_saved_message(client: TelegramClient, text: str) -> None:
     This avoids Bot API token/chat ID problems entirely and uses the already
     authorized Telegram user session.
     """
-    await client.send_message(
-        "me",
-        text,
-        parse_mode="html",
-        link_preview=False,
-    )
+    # Telegram может временно ограничить отправку (FloodWait).
+    # В таком случае ждём указанное Telegram время и повторяем отправку.
+    while True:
+        try:
+            await client.send_message(
+                "me",
+                text,
+                parse_mode="html",
+                link_preview=False,
+            )
+            return
+        except FloodWaitError as exc:
+            wait_seconds = int(exc.seconds) + 2
+            logging.warning(
+                "Telegram ограничил отправку. Жду %d секунд и повторяю.",
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
 
 
 def read_state() -> dict[str, Any] | None:
@@ -256,6 +274,9 @@ async def main() -> None:
             return
 
         scanned = 0
+        alerts: list[str] = []
+        stop_scan = False
+
         for dialog in dialogs:
             entity = dialog.entity
             key = str(entity.id)
@@ -271,10 +292,17 @@ async def main() -> None:
             if latest_id <= previous_id:
                 continue
 
-            # Read all messages since the previous checkpoint, oldest first.
+            # Запоминаем ID последнего реально просмотренного сообщения.
+            # Если за один запуск найдено много совпадений, продолжим с этого места
+            # в следующем запуске, а не пропустим оставшуюся очередь.
+            last_processed_id = previous_id
+
+            # Read messages since the previous checkpoint, oldest first.
             async for message in client.iter_messages(entity, min_id=previous_id, reverse=True):
                 if message.id <= previous_id or message.id > latest_id:
                     continue
+                last_processed_id = message.id
+
                 if getattr(message, "out", False):
                     continue
                 body = message.message or ""
@@ -317,15 +345,39 @@ async def main() -> None:
                 link = make_message_link(entity, message.id)
                 if link:
                     parts += ["", f'<a href="{html.escape(link, quote=True)}">Открыть сообщение в Telegram</a>']
-                await send_saved_message(client, "\n".join(parts))
-                logging.info("Alert sent: %s | %s", title, ", ".join(found))
-            groups_state[key] = latest_id
+                alerts.append("\n".join(parts))
+
+                if len(alerts) >= MAX_ALERTS_PER_RUN:
+                    stop_scan = True
+                    break
+
+            groups_state[key] = last_processed_id
             changed = True
             scanned += 1
+            if stop_scan:
+                break
+
+        # Несколько найденных сообщений объединяются в дайджесты.
+        # Это заметно уменьшает число отдельных отправок в Telegram.
+        for start in range(0, len(alerts), ALERTS_PER_DIGEST):
+            digest = alerts[start:start + ALERTS_PER_DIGEST]
+            await send_saved_message(client, "\n\n────────────\n\n".join(digest))
+            logging.info(
+                "Alert digest sent: %d of %d matching messages",
+                len(digest),
+                len(alerts),
+            )
+            if start + ALERTS_PER_DIGEST < len(alerts):
+                await asyncio.sleep(DIGEST_PAUSE_SECONDS)
 
         if changed:
             write_state({"initialized": True, "groups": groups_state})
-        logging.info("Done. Groups with new messages checked: %d", scanned)
+        logging.info(
+            "Done. Groups with new messages checked: %d; matching messages: %d%s",
+            scanned,
+            len(alerts),
+            "; remaining messages will be checked on the next run" if stop_scan else "",
+        )
     finally:
         await client.disconnect()
 
