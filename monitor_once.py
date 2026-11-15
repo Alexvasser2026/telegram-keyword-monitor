@@ -113,7 +113,7 @@ WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") 
 # Ограничиваем объём одной части уведомления, чтобы несколько сообщений
 # можно было объединить в одно сообщение Telegram.
 MAX_TEXT_CHARS = 850
-MAX_ALERTS_PER_RUN = 12
+MAX_ALERTS_PER_RUN = 200
 ALERTS_PER_DIGEST = 3
 DIGEST_PAUSE_SECONDS = 2
 
@@ -238,6 +238,8 @@ async def main() -> None:
     groups_state: dict[str, int] = {
         str(k): int(v) for k, v in (state.get("groups") or {}).items()
     }
+    # Round-robin start point prevents a very active group from starving others.
+    next_group_id = str(state.get("next_group_id") or "")
     changed = False
 
     client = TelegramClient(StringSession(TELEGRAM_SESSION), API_ID, API_HASH)
@@ -277,7 +279,17 @@ async def main() -> None:
         alerts: list[str] = []
         stop_scan = False
 
-        for dialog in dialogs:
+        # Rotate the first group on each capped run. This keeps backlogs in one
+        # busy group from preventing the remaining groups from being checked.
+        if dialogs and next_group_id:
+            start_index = next(
+                (i for i, item in enumerate(dialogs)
+                 if str(getattr(item.entity, "id", "")) == next_group_id),
+                0,
+            )
+            dialogs = dialogs[start_index:] + dialogs[:start_index]
+
+        for dialog_index, dialog in enumerate(dialogs):
             entity = dialog.entity
             key = str(entity.id)
             latest = getattr(dialog, "message", None)
@@ -355,6 +367,11 @@ async def main() -> None:
             changed = True
             scanned += 1
             if stop_scan:
+                # Resume from the following group on the next scheduled run.
+                next_group_id = (
+                    str(getattr(dialogs[(dialog_index + 1) % len(dialogs)].entity, "id", ""))
+                    if dialogs else ""
+                )
                 break
 
         # Несколько найденных сообщений объединяются в дайджесты.
@@ -371,7 +388,11 @@ async def main() -> None:
                 await asyncio.sleep(DIGEST_PAUSE_SECONDS)
 
         if changed:
-            write_state({"initialized": True, "groups": groups_state})
+            write_state({
+                "initialized": True,
+                "groups": groups_state,
+                "next_group_id": next_group_id,
+            })
         logging.info(
             "Done. Groups with new messages checked: %d; matching messages: %d%s",
             scanned,
