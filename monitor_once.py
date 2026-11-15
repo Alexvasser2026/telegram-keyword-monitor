@@ -16,6 +16,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel
 
@@ -24,6 +25,7 @@ API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "").strip()
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
 STATE_ENCRYPTION_KEY = os.getenv("STATE_ENCRYPTION_KEY", "").strip().encode()
+
 # Стандартный словарь студенческих запросов. KEYWORDS из GitHub Variables
 # добавляются к нему, а не заменяют его.
 DEFAULT_KEYWORDS = [
@@ -101,15 +103,20 @@ DEFAULT_KEYWORDS = [
 
 CUSTOM_KEYWORDS = [x.strip() for x in os.getenv("KEYWORDS", "").split("|") if x.strip()]
 # Пользовательские фразы дополняют стандартные. Повторы удаляются без учёта регистра.
-KEYWORDS = []
-_seen_keywords = set()
+KEYWORDS: list[str] = []
+_seen_keywords: set[str] = set()
 for _keyword in [*DEFAULT_KEYWORDS, *CUSTOM_KEYWORDS]:
     _normalized_keyword = _keyword.lower().replace("ё", "е").strip()
     if _normalized_keyword and _normalized_keyword not in _seen_keywords:
         _seen_keywords.add(_normalized_keyword)
         KEYWORDS.append(_keyword)
+
 WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") if x.strip()]
 MAX_TEXT_CHARS = 2600
+MAX_ALERTS_PER_RUN = 100
+ALERTS_PER_DIGEST = 3
+DIGEST_PAUSE_SECONDS = 10
+MAX_DIGEST_CHARS = 3600
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -165,18 +172,25 @@ def make_message_link(entity: Any, message_id: int) -> str | None:
     return None
 
 
-async def send_saved_message(client: TelegramClient, text: str) -> None:
-    """Send notifications to the account's Telegram Saved Messages (Избранное).
-
-    This avoids Bot API token/chat ID problems entirely and uses the already
-    authorized Telegram user session.
-    """
-    await client.send_message(
-        "me",
-        text,
-        parse_mode="html",
-        link_preview=False,
-    )
+async def send_saved_message(client: TelegramClient, text: str) -> int:
+    """Send one digest to Saved Messages and retry after Telegram FloodWait."""
+    while True:
+        try:
+            sent = await client.send_message(
+                "me",
+                text,
+                parse_mode="html",
+                link_preview=False,
+            )
+            logging.info("SEND_ACCEPTED: saved_message_id=%s", sent.id)
+            return int(sent.id)
+        except FloodWaitError as exc:
+            wait_seconds = int(exc.seconds) + 2
+            logging.warning(
+                "Telegram FloodWait: жду %d секунд и повторяю ту же отправку.",
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
 
 
 def read_state() -> dict[str, Any] | None:
@@ -200,6 +214,68 @@ def write_state(state: dict[str, Any]) -> None:
     STATE_FILE.write_bytes(encrypted)
 
 
+def build_alert(entity: Any, message: Any, sender: Any, found: list[str]) -> str:
+    title = getattr(entity, "title", None) or "Группа без названия"
+    body = message.message or ""
+    source_text = body[:MAX_TEXT_CHARS]
+    if len(body) > MAX_TEXT_CHARS:
+        source_text += "…"
+    parts = [
+        "<b>🔔 Найдено сообщение по ключевым словам</b>",
+        f"<b>Группа:</b> {html.escape(title)}",
+        f"<b>Автор:</b> {html.escape(sender_label(sender))}",
+        f"<b>Совпадения:</b> {html.escape(', '.join(found))}",
+        "",
+        f"<b>Сообщение:</b>\n{html.escape(source_text)}",
+    ]
+    link = make_message_link(entity, message.id)
+    if link:
+        parts += ["", f'<a href="{html.escape(link, quote=True)}">Открыть сообщение в Telegram</a>']
+    return "\n".join(parts)
+
+
+async def send_digests(client: TelegramClient, alerts: list[str]) -> None:
+    """Pack up to three alerts per Telegram message without exceeding a safe text size."""
+    separator = "\n\n────────────\n\n"
+    digests: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+
+    for alert in alerts:
+        extra_length = len(alert) + (len(separator) if current else 0)
+        if current and (
+            len(current) >= ALERTS_PER_DIGEST
+            or current_length + extra_length > MAX_DIGEST_CHARS
+        ):
+            digests.append(current)
+            current = []
+            current_length = 0
+            extra_length = len(alert)
+        current.append(alert)
+        current_length += extra_length
+
+    if current:
+        digests.append(current)
+
+    total = len(alerts)
+    sent_messages = 0
+    for digest_index, digest in enumerate(digests):
+        digest_text = separator.join(digest)
+        sent_id = await send_saved_message(client, digest_text)
+        sent_messages += 1
+        logging.info(
+            "Alert digest sent: %d matching messages; total=%d; digest=%d/%d; saved_message_id=%s",
+            len(digest),
+            total,
+            digest_index + 1,
+            len(digests),
+            sent_id,
+        )
+        if digest_index + 1 < len(digests):
+            logging.info("Пауза %d секунд между дайджестами.", DIGEST_PAUSE_SECONDS)
+            await asyncio.sleep(DIGEST_PAUSE_SECONDS)
+
+
 async def main() -> None:
     missing = []
     if API_ID <= 0:
@@ -220,16 +296,25 @@ async def main() -> None:
     groups_state: dict[str, int] = {
         str(k): int(v) for k, v in (state.get("groups") or {}).items()
     }
+    next_group_id = str(state.get("next_group_id") or "")
     changed = False
 
     client = TelegramClient(StringSession(TELEGRAM_SESSION), API_ID, API_HASH)
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            raise RuntimeError("TELEGRAM_SESSION is expired or invalid. Generate a new session and update the secret.")
+            raise RuntimeError(
+                "TELEGRAM_SESSION is expired or invalid. Generate a new session and update the secret."
+            )
+
         me = await client.get_me()
         name = getattr(me, "username", None) or getattr(me, "first_name", None) or "аккаунт"
-        logging.info("Connected to Telegram as %s", name)
+        logging.info(
+            "Connected to Telegram as %s; account_id=%s; username=@%s",
+            name,
+            getattr(me, "id", "unknown"),
+            getattr(me, "username", None) or "not_set",
+        )
 
         dialogs = []
         async for dialog in client.iter_dialogs(limit=None):
@@ -243,27 +328,39 @@ async def main() -> None:
                 latest = getattr(dialog, "message", None)
                 latest_id = int(getattr(latest, "id", 0) or 0)
                 groups_state[str(entity.id)] = latest_id
-            state = {"initialized": True, "groups": groups_state}
-            write_state(state)
+            write_state({"initialized": True, "groups": groups_state, "next_group_id": ""})
             await send_saved_message(
                 client,
                 "✅ <b>Мониторинг включён.</b>\n"
                 f"Аккаунт: {html.escape(name)}\n"
                 f"Групп под наблюдением: {len(dialogs)}\n"
-                "Буду проверять новые сообщения примерно раз в 5 минут. Старые сообщения не проверяю.",
+                "Буду проверять новые сообщения по расписанию GitHub Actions. Старые сообщения не проверяю.",
             )
             logging.info("Baseline saved for %d groups", len(dialogs))
             return
 
+        # При переполненной очереди начинаем следующий запуск с другой группы.
+        if dialogs and next_group_id:
+            start_index = next(
+                (i for i, item in enumerate(dialogs)
+                 if str(getattr(item.entity, "id", "")) == next_group_id),
+                0,
+            )
+            dialogs = dialogs[start_index:] + dialogs[:start_index]
+
         scanned = 0
-        for dialog in dialogs:
+        alerts: list[str] = []
+        stop_scan = False
+        next_group_id_to_save = ""
+
+        for dialog_index, dialog in enumerate(dialogs):
             entity = dialog.entity
             key = str(entity.id)
             latest = getattr(dialog, "message", None)
             latest_id = int(getattr(latest, "id", 0) or 0)
             previous_id = groups_state.get(key)
 
-            # A newly discovered group starts from the current latest message to avoid alert floods.
+            # Новые группы начинаем с текущего последнего сообщения, чтобы не создавать лавину.
             if previous_id is None:
                 groups_state[key] = latest_id
                 changed = True
@@ -271,23 +368,27 @@ async def main() -> None:
             if latest_id <= previous_id:
                 continue
 
-            # Read all messages since the previous checkpoint, oldest first.
+            last_processed_id = previous_id
             async for message in client.iter_messages(entity, min_id=previous_id, reverse=True):
                 if message.id <= previous_id or message.id > latest_id:
                     continue
+
+                # Сохраняем позицию и для сообщений без совпадений, чтобы не перечитывать их.
+                last_processed_id = int(message.id)
+
                 if getattr(message, "out", False):
                     continue
                 body = message.message or ""
                 if not body.strip():
                     continue
+
                 normalized = norm(body)
-                found = []
+                found: list[str] = []
                 for word in KEYWORDS:
                     normalized_word = norm(word)
                     if not normalized_word:
                         continue
-                    # Короткие сокращения (ДЗ, ЛР, КП и т. п.) ищем как отдельные
-                    # слова, чтобы, например, «лр» не совпадало внутри другого слова.
+                    # Короткие сокращения ищем как отдельные слова.
                     if len(normalized_word) <= 4 and re.fullmatch(r"[\w/.-]+", normalized_word):
                         pattern = rf"(?<!\w){re.escape(normalized_word)}(?!\w)"
                         matched = re.search(pattern, normalized) is not None
@@ -295,6 +396,7 @@ async def main() -> None:
                         matched = normalized_word in normalized
                     if matched:
                         found.append(word)
+
                 if not found:
                     continue
 
@@ -302,30 +404,49 @@ async def main() -> None:
                     sender = await message.get_sender()
                 except Exception:
                     sender = None
-                title = getattr(entity, "title", None) or "Группа без названия"
-                source_text = body[:MAX_TEXT_CHARS]
-                if len(body) > MAX_TEXT_CHARS:
-                    source_text += "…"
-                parts = [
-                    "<b>🔔 Найдено сообщение по ключевым словам</b>",
-                    f"<b>Группа:</b> {html.escape(title)}",
-                    f"<b>Автор:</b> {html.escape(sender_label(sender))}",
-                    f"<b>Совпадения:</b> {html.escape(', '.join(found))}",
-                    "",
-                    f"<b>Сообщение:</b>\n{html.escape(source_text)}",
-                ]
-                link = make_message_link(entity, message.id)
-                if link:
-                    parts += ["", f'<a href="{html.escape(link, quote=True)}">Открыть сообщение в Telegram</a>']
-                await send_saved_message(client, "\n".join(parts))
-                logging.info("Alert sent: %s | %s", title, ", ".join(found))
-            groups_state[key] = latest_id
+
+                alerts.append(build_alert(entity, message, sender, found))
+                logging.info(
+                    "Match collected: group=%s; message_id=%s; total_this_run=%d",
+                    getattr(entity, "title", None) or "Группа без названия",
+                    message.id,
+                    len(alerts),
+                )
+
+                if len(alerts) >= MAX_ALERTS_PER_RUN:
+                    stop_scan = True
+                    break
+
+            # Если лимит достигнут, сохраняем ID последнего реально обработанного сообщения,
+            # чтобы оставшаяся часть очереди не потерялась и была проверена в следующих запусках.
+            groups_state[key] = last_processed_id if stop_scan else latest_id
             changed = True
             scanned += 1
 
-        if changed:
-            write_state({"initialized": True, "groups": groups_state})
-        logging.info("Done. Groups with new messages checked: %d", scanned)
+            if stop_scan:
+                next_group_id_to_save = str(
+                    getattr(dialogs[(dialog_index + 1) % len(dialogs)].entity, "id", "")
+                ) if dialogs else ""
+                break
+
+        # Отправляем найденные сообщения группами по три; между дайджестами ждём 10 секунд.
+        # При FloodWait send_saved_message ждёт срок Telegram и повторяет эту же отправку.
+        await send_digests(client, alerts)
+
+        if changed or stop_scan:
+            write_state({
+                "initialized": True,
+                "groups": groups_state,
+                "next_group_id": next_group_id_to_save,
+            })
+
+        logging.info(
+            "Done. Groups with new messages checked: %d; matching messages: %d; limit_per_run: %d%s",
+            scanned,
+            len(alerts),
+            MAX_ALERTS_PER_RUN,
+            "; remaining messages will be checked on the next run" if stop_scan else "",
+        )
     finally:
         await client.disconnect()
 
