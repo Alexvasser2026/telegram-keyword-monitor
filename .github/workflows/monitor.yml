@@ -1,9 +1,9 @@
-name: Telegram keyword monitor
+ame: Telegram keyword monitor
 
 on:
   schedule:
-    # Approximately every 5 minutes, offset from the top of the hour.
-    - cron: "2-59/5 * * * *"
+    # Every 20 minutes (UTC): 02, 22, and 42 minutes past each hour.
+    - cron: '2,22,42 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,8 @@ concurrency:
 jobs:
   check-messages:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Allow time for up to 100 matches, digest pauses, and Telegram FloodWait.
+    timeout-minutes: 15
     steps:
       - name: Get project files
         uses: actions/checkout@v4
