@@ -2,8 +2,7 @@ name: Telegram keyword monitor
 
 on:
   schedule:
-    # Every 10 minutes.
-    - cron: '*/10 * * * *'
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,6 +11,7 @@ permissions:
 concurrency:
   group: telegram-keyword-monitor
   cancel-in-progress: false
+  queue: max
 
 jobs:
   check-messages:
