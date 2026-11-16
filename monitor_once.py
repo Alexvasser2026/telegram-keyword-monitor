@@ -113,8 +113,8 @@ for _keyword in [*DEFAULT_KEYWORDS, *CUSTOM_KEYWORDS]:
 
 WATCH_GROUPS_RAW = [x.strip() for x in os.getenv("WATCH_GROUPS", "").split(",") if x.strip()]
 MAX_TEXT_CHARS = 2600
-MAX_ALERTS_PER_RUN = 100
-ALERTS_PER_DIGEST = 3
+MAX_ALERTS_PER_RUN = 50
+ALERTS_PER_DIGEST = 5
 DIGEST_PAUSE_SECONDS = 10
 MAX_DIGEST_CHARS = 3600
 
@@ -429,7 +429,7 @@ async def main() -> None:
                 ) if dialogs else ""
                 break
 
-        # Отправляем найденные сообщения группами по три; между дайджестами ждём 10 секунд.
+        # Отправляем найденные сообщения группами до пяти; между дайджестами ждём 10 секунд.
         # При FloodWait send_saved_message ждёт срок Telegram и повторяет эту же отправку.
         await send_digests(client, alerts)
 
